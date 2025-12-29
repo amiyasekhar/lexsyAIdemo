@@ -17,7 +17,6 @@ export default function RootLayout({
         <div className="shell">
           <header className="header">
             <div className="brand">
-              <div className="logo">LA</div>
               <div>
                 <div className="title">LexsyAI</div>
                 <div className="subtitle">Document Placeholder Agent</div>
@@ -33,12 +32,7 @@ export default function RootLayout({
             </a>
           </header>
           <main className="main">{children}</main>
-          <footer className="footer">
-            <span>
-              Tip: Use placeholders like <code>{"{{ClientName}}"}</code> or{" "}
-              <code>{"[[EffectiveDate]]"}</code> or <code>{"<<Fee>>"}</code>.
-            </span>
-          </footer>
+          <footer className="footer" />
         </div>
       </body>
     </html>
