@@ -19,6 +19,7 @@ const BodySchema = z.object({
 
 const LLMFieldSchema = z.object({
   field_id: z.string(),
+  canonical_id: z.string(),
   raw_placeholder: z.string(),
   label_for_user: z.string(),
   who_should_fill: z.enum(["company", "counterparty", "either", "system"]),
@@ -51,6 +52,14 @@ Rules:
 - Output ONLY valid JSON: an array of objects matching the schema described.
 - Do NOT invent actual values. Only describe what should be entered.
 - Prefer stable dot-notation field_id values, e.g. company.name, investor.name, safe.date, safe.purchase_amount.
+- Also return canonical_id: semantically equivalent fields MUST share the same canonical_id.
+- canonical_id MUST be stable and typed, e.g.:
+  - money.investment_amount
+  - money.valuation_cap
+  - party.company.name
+  - party.investor.name
+  - legal.governing_law
+- CRITICAL: investment amount and valuation cap MUST NOT share canonical_id.
 - If the placeholder is clearly for the counterparty (e.g., Investor name, Purchase Amount), set who_should_fill="counterparty" and ask_user=false.
 - Typed signatures only: for signature blocks, ask for printed name/title/email/address where appropriate, not a drawn signature.
 - If uncertain, set lower confidence and explain briefly in how_to_fill.
@@ -81,6 +90,7 @@ export async function POST(req: Request) {
     const schemaHint = `[
   {
     "field_id": "string",
+    "canonical_id": "string",
     "raw_placeholder": "string",
     "label_for_user": "string",
     "who_should_fill": "company|counterparty|either|system",
@@ -138,7 +148,20 @@ export async function POST(req: Request) {
       );
     }
 
-    return NextResponse.json(out.data);
+    // Hard safety guardrail for money fields: override canonical_id if model misclusters.
+    const safe = out.data.map((f) => {
+      if (f.expected_type !== "money") return f;
+      const ev = `${f.label_for_user} ${f.evidence_quote}`.toLowerCase();
+      if (ev.includes("valuation cap") || ev.includes("post-money valuation cap")) {
+        return { ...f, canonical_id: "money.valuation_cap" };
+      }
+      if (ev.includes("purchase amount") || ev.includes("investment amount") || ev.includes("amount being invested")) {
+        return { ...f, canonical_id: "money.investment_amount" };
+      }
+      return f;
+    });
+
+    return NextResponse.json(safe);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 500 });

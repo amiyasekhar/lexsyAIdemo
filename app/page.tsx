@@ -11,6 +11,7 @@ import {
 
 type LLMField = {
   field_id: string;
+  canonical_id: string;
   raw_placeholder: string;
   label_for_user: string;
   who_should_fill: "company" | "counterparty" | "either" | "system";
@@ -44,7 +45,7 @@ type ChatField = {
 
 type Occurrence = {
   raw_placeholder: string;
-  fieldKey: string; // canonical key
+  fieldKey: string; // key used to look up value (canonical_id)
   location_hint: string;
 };
 
@@ -245,6 +246,12 @@ async function patchDocxArrayBufferForPreview(
   const getTextNodesInPara = (p: Element) =>
     Array.from(p.getElementsByTagNameNS("*", "t")) as Element[];
 
+  const norm = (s: string) =>
+    (s || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
   for (let pIdx = 0; pIdx < paragraphs.length; pIdx++) {
     const p = paragraphs[pIdx]!;
     const tNodes = getTextNodesInPara(p);
@@ -269,21 +276,23 @@ async function patchDocxArrayBufferForPreview(
         for (let oi = 0; oi < occList.length; oi++) {
           const raw = occList[oi]!.raw || "";
           if (!raw) continue;
-          if (acc === raw) {
+          const accN = norm(acc);
+          const rawN = norm(raw);
+          if (accN === rawN) {
             matchIdx = oi;
             matchKey = occList[oi]!.key;
-            includeDollar = acc.startsWith("$");
+            includeDollar = accN.startsWith("$");
             break;
           }
           // raw is "[___]" but acc is "$[___]"
-          if (!raw.startsWith("$") && acc.startsWith("$") && acc.slice(1) === raw) {
+          if (!rawN.startsWith("$") && accN.startsWith("$") && accN.slice(1) === rawN) {
             matchIdx = oi;
             matchKey = occList[oi]!.key;
             includeDollar = true;
             break;
           }
           // raw is "$[___]" but acc is "[___]"
-          if (raw.startsWith("$") && !acc.startsWith("$") && raw.slice(1) === acc) {
+          if (rawN.startsWith("$") && !accN.startsWith("$") && rawN.slice(1) === accN) {
             matchIdx = oi;
             matchKey = occList[oi]!.key;
             includeDollar = false;
@@ -294,7 +303,11 @@ async function patchDocxArrayBufferForPreview(
         if (matchIdx !== -1 && matchKey) {
           const v = (values[matchKey] || "").trim();
           if (v) {
-            const replacement = includeDollar ? `$${v}` : v;
+            // Preserve any leading/trailing whitespace that was part of the matched token span
+            // (e.g. templates often have ", [Company Name]" where the leading space can be inside the same run).
+            const leadWs = /^[\s\u00a0]+/.exec(acc)?.[0] ?? "";
+            const trailWs = /[\s\u00a0]+$/.exec(acc)?.[0] ?? "";
+            const replacement = `${leadWs}${includeDollar ? `$${v}` : v}${trailWs}`;
             tNodes[i]!.textContent = replacement;
             for (let k = 1; k < idxs.length; k++) tNodes[idxs[k]!]!.textContent = "";
             const run = tNodes[i]!.closest("w\\:r, r") as Element | null;
@@ -671,16 +684,16 @@ export default function HomePage() {
 
           const occ: Occurrence[] = list.map((f) => ({
             raw_placeholder: f.raw_placeholder,
-            fieldKey: f.field_id,
+            fieldKey: f.canonical_id || f.field_id,
             location_hint: f.location_hint
           }));
           setOccurrences(occ);
 
-          // No dedupe: treat every field_id as distinct (no interconnectedness).
+          // Ask once per canonical_id (semantic propagation).
           const byKey = new Map<string, ChatField>();
           const firstLoc = new Map<string, number>();
           for (const f of list) {
-            const key = f.field_id;
+            const key = f.canonical_id || f.field_id;
             const existing = byKey.get(key);
             const label = f.label_for_user || key;
             const q =
