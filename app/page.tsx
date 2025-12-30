@@ -554,6 +554,41 @@ export default function HomePage() {
   );
   const [jumpToTopOnUpdate, setJumpToTopOnUpdate] = useState(false);
 
+  const handlePickedFile = (f: File | null) => {
+    setFile(f);
+    setFilename(null);
+    setPreviewType(null);
+    if (pdfUrl) URL.revokeObjectURL(pdfUrl);
+    setPdfUrl(null);
+    setFields([]);
+    setClassified([]);
+    setOccurrences([]);
+    setValues({});
+    setDraftValues({});
+    setSkipped(new Set());
+    setChat([]);
+    setCurrentKey(null);
+    setInput("");
+    setLoadingFields(false);
+    setFieldsError(null);
+    originalDocxRef.current = null;
+
+    if (!f) return;
+    setFilename(f.name);
+    const ext = (f.name || "").toLowerCase().split(".").pop();
+    if (ext === "pdf") {
+      setPreviewType("pdf");
+      setPdfUrl(URL.createObjectURL(f));
+    } else if (ext === "docx") {
+      setPreviewType("docx");
+    } else {
+      setPreviewType(null);
+    }
+  };
+
+  const [isDragOver, setIsDragOver] = useState(false);
+  const currentField = currentKey ? fields.find((f) => f.key === currentKey) : null;
+
   const nextAskableKey = (vals: Record<string, string>, skippedSet: Set<string>) => {
     for (const f of fields) {
       if (skippedSet.has(f.key)) continue;
@@ -696,12 +731,8 @@ export default function HomePage() {
             const key = f.canonical_id || f.field_id;
             const existing = byKey.get(key);
             const label = f.label_for_user || key;
-            const q =
-              f.how_to_fill && f.how_to_fill.trim().length
-                ? f.how_to_fill.trim().endsWith("?")
-                  ? f.how_to_fill.trim()
-                  : `Please provide: ${label}. ${f.how_to_fill.trim()}`
-                : `Please provide: ${label}.`;
+            // Keep prompts minimal: just show the human label.
+            const q = label;
 
             const m = /paragraph:(\d+)/.exec(f.location_hint || "");
             const locNum = m ? Number(m[1]) : 1e9;
@@ -759,7 +790,7 @@ export default function HomePage() {
           const fb: ChatField[] = fallback.map((f) => ({
             key: f.key,
             label: f.label,
-            question: f.question,
+            question: f.label,
             group: "Detected (no AI labeling)",
             ask_user: true
           }));
@@ -776,7 +807,7 @@ export default function HomePage() {
         const fb: ChatField[] = fallback.map((f) => ({
           key: f.key,
           label: f.label,
-          question: f.question,
+          question: f.label,
           group: "Detected (no AI labeling)",
           ask_user: true
         }));
@@ -806,43 +837,43 @@ export default function HomePage() {
         </div>
         <div className="cardBody">
           <div className="row">
-            <input
-              className="input"
-              type="file"
-              accept=".docx,.pdf,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-              onChange={(e) => {
-                const f = e.target.files?.[0] || null;
-                setFile(f);
-                setFilename(null);
-                setPreviewType(null);
-                if (pdfUrl) URL.revokeObjectURL(pdfUrl);
-                setPdfUrl(null);
-                setFields([]);
-                setClassified([]);
-                setOccurrences([]);
-                setValues({});
-                setDraftValues({});
-                setSkipped(new Set());
-                setChat([]);
-                setCurrentKey(null);
-                setInput("");
-                setLoadingFields(false);
-                setFieldsError(null);
-                originalDocxRef.current = null;
-
-                if (!f) return;
-                setFilename(f.name);
-                const ext = (f.name || "").toLowerCase().split(".").pop();
-                if (ext === "pdf") {
-                  setPreviewType("pdf");
-                  setPdfUrl(URL.createObjectURL(f));
-                } else if (ext === "docx") {
-                  setPreviewType("docx");
-                } else {
-                  setPreviewType(null);
-                }
+            <div
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsDragOver(true);
               }}
-            />
+              onDragLeave={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsDragOver(false);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsDragOver(false);
+                const f = e.dataTransfer.files?.[0] || null;
+                if (!f) return;
+                handlePickedFile(f);
+              }}
+              style={{
+                width: "100%",
+                border: isDragOver ? "2px dashed rgba(126, 214, 223, 0.9)" : "2px dashed rgba(255,255,255,0.18)",
+                borderRadius: 16,
+                padding: 14,
+                background: isDragOver ? "rgba(126, 214, 223, 0.12)" : "rgba(0,0,0,0.10)"
+              }}
+            >
+              <div className="small" style={{ marginBottom: 8, opacity: 0.9 }}>
+                Drag & drop a <code>.docx</code> or <code>.pdf</code> here, or choose a file:
+              </div>
+              <input
+                className="input"
+                type="file"
+                accept=".docx,.pdf,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                onChange={(e) => handlePickedFile(e.target.files?.[0] || null)}
+              />
+            </div>
           </div>
 
           {filename ? (
@@ -926,7 +957,7 @@ export default function HomePage() {
                         loadingFields
                           ? "Extracting fields…"
                           : currentKey
-                            ? `Answer for ${currentKey}…`
+                            ? `Answer for ${prettyLabel(currentField || { key: currentKey, label: currentKey, question: "", group: "" })}…`
                             : "Done"
                       }
                       onChange={(e) => setInput(e.target.value)}
@@ -1089,9 +1120,7 @@ export default function HomePage() {
                                       <span className="pill pillWarn">skipped</span>
                                     ) : null}
                                   </div>
-                                  <div className="small" style={{ opacity: 0.7 }}>
-                                    <code>{f.key}</code>
-                                  </div>
+                                  <div className="small" style={{ opacity: 0.7 }} />
                                 </div>
                                 <input
                                   className="input"
