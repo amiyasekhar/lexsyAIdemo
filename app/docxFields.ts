@@ -22,7 +22,7 @@ export type DetectedField = {
 const BRACKET_TOKEN_RE = /\[[^\[\]\n]{1,120}\]/g;
 const BRACKET_BLANK_RE = /\$\[[\s_]{3,}\]|\[[\s_]{3,}\]/g;
 const UNDERLINE_RE = /_{3,}/g;
-const SIGNATURE_LABEL_RE = /^\s*(By:|Name:|Title:|Address:|Email:)\s*(.*)$/i;
+const SIGNATURE_LABEL_RE = /(By:|Name:|Title:|Address:|Email:)/gi;
 
 function normalizeKey(s: string) {
   return s
@@ -263,21 +263,56 @@ export async function detectDetectionsFromDocx(
   const xml = await docFile.async("string");
   const paragraphs = xml.match(/<w:p\b[\s\S]*?<\/w:p>/g) || [];
 
-  const lines: Array<{ line: string; location: string }> = [];
+  type ParaInfo = {
+    idx: number;
+    text: string;
+    hasTabs: boolean;
+    underlined: boolean;
+    location: string;
+  };
+
+  const infos: ParaInfo[] = [];
   for (let i = 0; i < paragraphs.length; i++) {
     const pXml = paragraphs[i]!;
-    const { text } = extractParagraphText(pXml);
-    const t = (text || "").trim();
-    if (t) lines.push({ line: t, location: `paragraph:${i}` });
+    const { text, tabCount } = extractParagraphText(pXml);
+    infos.push({
+      idx: i,
+      text: (text || "").replace(/\s+/g, " ").trim(),
+      hasTabs: tabCount > 0,
+      underlined: /<w:u\b/.test(pXml),
+      location: `paragraph:${i}`
+    });
   }
 
-  const detected: DetectedField[] = [];
-  for (let idx = 0; idx < lines.length; idx++) {
-    const line = lines[idx]!.line;
-    const loc = lines[idx]!.location;
-    const before = lines[idx - window]?.line || "";
-    const after = lines[idx + window]?.line || "";
+  const nearestPrevText = (i: number) => {
+    for (let k = i - 1; k >= 0; k--) {
+      if (infos[k]!.text) return infos[k]!.text;
+    }
+    return "";
+  };
+  const nearestNextText = (i: number) => {
+    for (let k = i + 1; k < infos.length; k++) {
+      if (infos[k]!.text) return infos[k]!.text;
+    }
+    return "";
+  };
 
+  const detected: DetectedField[] = [];
+  let section: "company" | "investor" | "unknown" = "unknown";
+  let lastLabel: string | null = null;
+
+  for (let i = 0; i < infos.length; i++) {
+    const info = infos[i]!;
+    const line = info.text;
+    const loc = info.location;
+
+    if (/INVESTOR:/i.test(line)) section = "investor";
+    if (/\[COMPANY\]/i.test(line) || /^\s*COMPANY\s*:?/i.test(line)) section = "company";
+
+    const before = nearestPrevText(i);
+    const after = nearestNextText(i);
+
+    // Bracket tokens / blanks from actual visible text.
     for (const m of line.matchAll(BRACKET_TOKEN_RE)) {
       detected.push({
         raw_placeholder: m[0]!,
@@ -300,21 +335,52 @@ export async function detectDetectionsFromDocx(
       });
     }
 
-    const sig = SIGNATURE_LABEL_RE.exec(line);
-    if (sig) {
+    // Signature/tab underline blanks: these often have NO placeholder text.
+    // We emit an "underline" placeholder for the blank itself so /api/fields can label it.
+    // Our preview patcher converts these to literal "________" in the same paragraph, so use that as raw_placeholder.
+    if (info.underlined && info.hasTabs) {
+      // Find any signature labels in this same paragraph text.
+      const labels = Array.from(line.matchAll(SIGNATURE_LABEL_RE)).map((m) => m[1] || m[0] || "");
+      if (labels.length) {
+        lastLabel = labels[labels.length - 1] || lastLabel;
+        // One underline field per label (By/Name/Title/Address/Email)
+        for (const lab of labels) {
+          detected.push({
+            raw_placeholder: "________",
+            kind: "underline",
+            context_before: before,
+            context_line: `${section.toUpperCase()}: ${lab} ________`,
+            context_after: after,
+            location_hint: loc
+          });
+        }
+      } else if (!line) {
+        // Common: Address continuation line is a blank underline line with tabs only.
+        const synthetic = lastLabel?.toLowerCase().includes("address")
+          ? `${section.toUpperCase()}: Address (line 2) ________`
+          : `${section.toUpperCase()}: Blank ________`;
+        detected.push({
+          raw_placeholder: "________",
+          kind: "underline",
+          context_before: before,
+          context_line: synthetic,
+          context_after: after,
+          location_hint: loc
+        });
+      } else {
+        detected.push({
+          raw_placeholder: "________",
+          kind: "underline",
+          context_before: before,
+          context_line: `${section.toUpperCase()}: ${line} ________`,
+          context_after: after,
+          location_hint: loc
+        });
+      }
+    } else if (UNDERLINE_RE.test(line) && !BRACKET_BLANK_RE.test(line)) {
+      // literal underscore runs in text
       detected.push({
-        raw_placeholder: sig[1]!,
-        kind: "signature_label",
-        context_before: before,
-        context_line: line,
-        context_after: after,
-        location_hint: loc
-      });
-    }
-
-    if (UNDERLINE_RE.test(line) && !BRACKET_BLANK_RE.test(line)) {
-      detected.push({
-        raw_placeholder: "__________",
+        raw_placeholder: "________",
         kind: "underline",
         context_before: before,
         context_line: line,

@@ -148,15 +148,6 @@ function replaceTokenInRuns(xml: string, raw: string, value: string) {
   });
 }
 
-function canonicalizeFieldId(fieldId: string) {
-  // Collapse fields.json-style suffixes into one key so we ask once and fill everywhere.
-  return fieldId
-    .replace(/_blank_\d+$/i, "")
-    .replace(/_\d+$/i, "")
-    .replace(/_blank$/i, "")
-    .trim();
-}
-
 async function patchDocxArrayBufferForPreview(
   arrayBuffer: ArrayBuffer,
   values: Record<string, string>,
@@ -231,23 +222,35 @@ async function patchDocxArrayBufferForPreview(
     run.appendChild(t);
   }
 
-  // 2) Build mapping raw_placeholder -> canonical field key and apply replacements safely in w:t nodes.
-  const rawToKey = new Map<string, string>();
+  const parseParaIndex = (hint: string) => {
+    const m = /paragraph:(\d+)/.exec(hint || "");
+    return m ? Number(m[1]) : null;
+  };
+
+  // Apply replacements BY LOCATION (paragraph) so identical placeholders like [_____________] don't overwrite other fields.
+  const occByPara = new Map<number, Array<{ raw: string; key: string }>>();
   for (const occ of occurrences) {
-    if (!rawToKey.has(occ.raw_placeholder)) rawToKey.set(occ.raw_placeholder, occ.fieldKey);
+    const pi = parseParaIndex(occ.location_hint);
+    if (pi === null) continue;
+    const arr = occByPara.get(pi) || [];
+    arr.push({ raw: occ.raw_placeholder, key: occ.fieldKey });
+    occByPara.set(pi, arr);
   }
 
   // Per paragraph, attempt to match placeholders even if split across multiple <w:t>.
   const paragraphs = Array.from(doc.getElementsByTagNameNS("*", "p"));
-  const rawList = Array.from(rawToKey.keys()).filter(Boolean);
-  const maxRawLen = rawList.reduce((m, s) => Math.max(m, s.length), 0);
+  const allRaw = Array.from(occurrences.map((o) => o.raw_placeholder)).filter(Boolean);
+  const maxRawLen = allRaw.reduce((m, s) => Math.max(m, s.length), 0);
 
   const getTextNodesInPara = (p: Element) =>
     Array.from(p.getElementsByTagNameNS("*", "t")) as Element[];
 
-  for (const p of paragraphs) {
+  for (let pIdx = 0; pIdx < paragraphs.length; pIdx++) {
+    const p = paragraphs[pIdx]!;
     const tNodes = getTextNodesInPara(p);
     if (!tNodes.length) continue;
+    const occList = (occByPara.get(pIdx) || []).slice();
+    if (!occList.length) continue;
 
     // Sliding window matching across consecutive <w:t> nodes.
     for (let i = 0; i < tNodes.length; i++) {
@@ -259,18 +262,46 @@ async function patchDocxArrayBufferForPreview(
         idxs.push(j);
         if (acc.length > maxRawLen + 2) break;
 
-        const key = rawToKey.get(acc);
-        if (key) {
-          const v = (values[key] || "").trim();
+        // Find an occurrence in this paragraph whose raw_placeholder matches this acc (with $-flex).
+        let matchIdx = -1;
+        let matchKey: string | null = null;
+        let includeDollar = false;
+        for (let oi = 0; oi < occList.length; oi++) {
+          const raw = occList[oi]!.raw || "";
+          if (!raw) continue;
+          if (acc === raw) {
+            matchIdx = oi;
+            matchKey = occList[oi]!.key;
+            includeDollar = acc.startsWith("$");
+            break;
+          }
+          // raw is "[___]" but acc is "$[___]"
+          if (!raw.startsWith("$") && acc.startsWith("$") && acc.slice(1) === raw) {
+            matchIdx = oi;
+            matchKey = occList[oi]!.key;
+            includeDollar = true;
+            break;
+          }
+          // raw is "$[___]" but acc is "[___]"
+          if (raw.startsWith("$") && !acc.startsWith("$") && raw.slice(1) === acc) {
+            matchIdx = oi;
+            matchKey = occList[oi]!.key;
+            includeDollar = false;
+            break;
+          }
+        }
+
+        if (matchIdx !== -1 && matchKey) {
+          const v = (values[matchKey] || "").trim();
           if (v) {
-            const replacement = acc.startsWith("$") ? `$${v}` : v;
-            // Put replacement into first node, clear the rest.
+            const replacement = includeDollar ? `$${v}` : v;
             tNodes[i]!.textContent = replacement;
             for (let k = 1; k < idxs.length; k++) tNodes[idxs[k]!]!.textContent = "";
-            // Strip caps/smallCaps on the run containing the first node.
             const run = tNodes[i]!.closest("w\\:r, r") as Element | null;
             if (run) stripCapsSmallCapsDom(run);
           }
+          // consume this occurrence so we don't apply it again
+          occList.splice(matchIdx, 1);
           break;
         }
 
@@ -279,22 +310,7 @@ async function patchDocxArrayBufferForPreview(
       }
     }
 
-    // Also handle bracket blanks without dollar using occurrences keys by matching raw without "$"
-    for (const raw of rawList) {
-      if (!raw.startsWith("$")) continue;
-      const rawNoDollar = raw.slice(1);
-      const key = rawToKey.get(raw);
-      if (!key) continue;
-      const v = (values[key] || "").trim();
-      if (!v) continue;
-      for (const t of tNodes) {
-        if ((t.textContent || "") === rawNoDollar) {
-          t.textContent = v;
-          const run = t.closest("w\\:r, r") as Element | null;
-          if (run) stripCapsSmallCapsDom(run);
-        }
-      }
-    }
+    // No global raw matching fallback; we intentionally avoid interconnectedness.
   }
 
   const serializer = new XMLSerializer();
@@ -527,7 +543,6 @@ export default function HomePage() {
 
   const nextAskableKey = (vals: Record<string, string>, skippedSet: Set<string>) => {
     for (const f of fields) {
-      if (f.ask_user === false) continue;
       if (skippedSet.has(f.key)) continue;
       if (!vals[f.key] || !vals[f.key]!.trim()) return f.key;
     }
@@ -656,16 +671,16 @@ export default function HomePage() {
 
           const occ: Occurrence[] = list.map((f) => ({
             raw_placeholder: f.raw_placeholder,
-            fieldKey: canonicalizeFieldId(f.field_id),
+            fieldKey: f.field_id,
             location_hint: f.location_hint
           }));
           setOccurrences(occ);
 
-          // Build a deduped list of fields (ask once per canonical key)
+          // No dedupe: treat every field_id as distinct (no interconnectedness).
           const byKey = new Map<string, ChatField>();
           const firstLoc = new Map<string, number>();
           for (const f of list) {
-            const key = canonicalizeFieldId(f.field_id);
+            const key = f.field_id;
             const existing = byKey.get(key);
             const label = f.label_for_user || key;
             const q =
@@ -706,7 +721,7 @@ export default function HomePage() {
             return (firstLoc.get(a.key) ?? 1e9) - (firstLoc.get(b.key) ?? 1e9);
           });
           setFields(deduped);
-          const firstKey = deduped.find((x) => x.ask_user !== false)?.key ?? null;
+          const firstKey = deduped[0]?.key ?? null;
           setCurrentKey(firstKey);
           if (firstKey) {
             setChat([
